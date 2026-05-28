@@ -511,19 +511,20 @@ def write_ai_html(report):
 
 def write_ai_feed(report):
     pub_date = to_rfc822(parse_timestamp(report["generated_at"]))
+    html_url = get_public_file_url(OUTPUT_HTML_FILE)
     xml = "".join(
         [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<rss version="2.0">',
             "<channel>",
             "<title>Paper Feed AI Summary</title>",
-            f"<link>{escape_xml(OUTPUT_HTML_FILE)}</link>",
+            f"<link>{escape_xml(html_url)}</link>",
             "<description>AI-generated literature digest for filtered papers</description>",
             "<language>zh-CN</language>",
             f"<lastBuildDate>{escape_xml(pub_date)}</lastBuildDate>",
             "<item>",
             f"<title>{escape_xml(report['title'])}</title>",
-            f"<link>{escape_xml(OUTPUT_HTML_FILE)}</link>",
+            f"<link>{escape_xml(html_url)}</link>",
             f"<description>{escape_xml(report['html'])}</description>",
             f"<guid isPermaLink=\"false\">{escape_xml(report['id'])}</guid>",
             f"<pubDate>{escape_xml(pub_date)}</pubDate>",
@@ -535,6 +536,28 @@ def write_ai_feed(report):
 
     with open(OUTPUT_FEED_FILE, "w", encoding="utf-8") as handle:
         handle.write(xml)
+
+
+def get_public_file_url(filename):
+    base_url = get_public_base_url()
+    if not base_url:
+        return filename
+    return f"{base_url}/{filename.lstrip('/')}"
+
+
+def get_public_base_url():
+    configured = os.environ.get("PAPER_FEED_PUBLIC_BASE_URL", "").strip()
+    if configured:
+        return configured.rstrip("/")
+
+    repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repository or "/" not in repository:
+        return ""
+
+    owner, repo = repository.split("/", 1)
+    if repo.lower() == f"{owner.lower()}.github.io":
+        return f"https://{owner}.github.io"
+    return f"https://{owner}.github.io/{repo}"
 
 
 def escape_xml(value):

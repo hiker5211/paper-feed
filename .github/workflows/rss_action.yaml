@@ -45,6 +45,7 @@ jobs:
         AI_SUMMARY_PROMPT: ${{ secrets.AI_SUMMARY_PROMPT }}
         AI_SUMMARY_INTERVAL_HOURS: ${{ secrets.AI_SUMMARY_INTERVAL_HOURS }}
         AI_SUMMARY_MAX_CANDIDATES: ${{ secrets.AI_SUMMARY_MAX_CANDIDATES }}
+        PAPER_FEED_PUBLIC_BASE_URL: ${{ vars.PAPER_FEED_PUBLIC_BASE_URL }}
       run: python ai_summary.py
 
     - name: Commit and Push changes

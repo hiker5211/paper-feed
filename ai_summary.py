@@ -14,15 +14,20 @@ INPUT_FEED_FILE = "filtered_feed.xml"
 OUTPUT_FEED_FILE = "ai_summary_feed.xml"
 OUTPUT_HTML_FILE = "ai_summary.html"
 STATE_FILE = "ai_summary_state.json"
+CONFIG_FILE = "paper_feed_config.json"
 
 DEFAULT_INTERVAL_HOURS = 24
 DEFAULT_TIMEOUT_SECONDS = 300
-SCREENING_BATCH_SIZE = 25
+DEFAULT_SCREENING_BATCH_SIZE = 10
 MAX_SELECTED_PAPERS = 40
 DEFAULT_MAX_CANDIDATES = 100
-RETRY_ATTEMPTS_PER_ROUND = 3
-RETRY_ROUNDS = 2
-RETRY_SLEEP_SECONDS = 10 * 60
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_MAX_PROMPT_TITLE_CHARS = 240
+DEFAULT_MAX_PROMPT_ABSTRACT_CHARS = 1200
+DEFAULT_RETRY_ATTEMPTS_PER_ROUND = 3
+DEFAULT_RETRY_ROUNDS = 2
+DEFAULT_RETRY_SLEEP_SECONDS = 10 * 60
+DEFAULT_REQUESTS_PER_MINUTE = 5
 
 BATCH_INSIGHT_SYSTEM_PROMPT = (
     "You are a world-class scientific literature screening and summarization assistant. "
@@ -48,6 +53,14 @@ class AiSummaryConfig:
     prompt: str
     interval_hours: int
     max_candidates: int
+    max_output_tokens: int
+    screening_batch_size: int
+    requests_per_minute: int
+    max_prompt_title_chars: int
+    max_prompt_abstract_chars: int
+    retry_attempts_per_round: int
+    retry_rounds: int
+    retry_sleep_seconds: int
 
 
 class ChatCompletionClient:
@@ -60,6 +73,7 @@ class ChatCompletionClient:
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.2,
+            "max_tokens": self.config.max_output_tokens,
         }
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -112,6 +126,34 @@ def get_env_int(name, default):
     return value if value > 0 else default
 
 
+def load_public_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def get_config_int(section, key, default, env_name=None):
+    if env_name and os.environ.get(env_name, "").strip():
+        return get_env_int(env_name, default)
+
+    return positive_int(section.get(key), default)
+
+
+def positive_int(value, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def load_api_config():
     raw = os.environ.get("AI_API_CONFIG", "").strip()
     if raw:
@@ -148,7 +190,13 @@ def load_api_config():
 
 
 def load_ai_config():
-    if not get_env_bool("AI_SUMMARY_ENABLED", True):
+    public_config = load_public_config()
+    ai_public_config = public_config.get("ai_summary", {})
+    if not isinstance(ai_public_config, dict):
+        ai_public_config = {}
+
+    enabled_default = bool(ai_public_config.get("enabled", True))
+    if not get_env_bool("AI_SUMMARY_ENABLED", enabled_default):
         return None
 
     api_config = load_api_config() or {}
@@ -169,8 +217,59 @@ def load_ai_config():
         api_key=api_key,
         model=model,
         prompt=prompt,
-        interval_hours=get_env_int("AI_SUMMARY_INTERVAL_HOURS", DEFAULT_INTERVAL_HOURS),
-        max_candidates=get_env_int("AI_SUMMARY_MAX_CANDIDATES", DEFAULT_MAX_CANDIDATES),
+        interval_hours=get_config_int(
+            ai_public_config,
+            "interval_hours",
+            DEFAULT_INTERVAL_HOURS,
+            "AI_SUMMARY_INTERVAL_HOURS",
+        ),
+        max_candidates=get_config_int(
+            ai_public_config,
+            "max_candidates",
+            DEFAULT_MAX_CANDIDATES,
+            "AI_SUMMARY_MAX_CANDIDATES",
+        ),
+        max_output_tokens=get_config_int(
+            ai_public_config,
+            "max_output_tokens",
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            "AI_SUMMARY_MAX_OUTPUT_TOKENS",
+        ),
+        screening_batch_size=get_config_int(
+            ai_public_config,
+            "screening_batch_size",
+            DEFAULT_SCREENING_BATCH_SIZE,
+        ),
+        requests_per_minute=get_config_int(
+            ai_public_config,
+            "requests_per_minute",
+            DEFAULT_REQUESTS_PER_MINUTE,
+        ),
+        max_prompt_title_chars=get_config_int(
+            ai_public_config,
+            "max_prompt_title_chars",
+            DEFAULT_MAX_PROMPT_TITLE_CHARS,
+        ),
+        max_prompt_abstract_chars=get_config_int(
+            ai_public_config,
+            "max_prompt_abstract_chars",
+            DEFAULT_MAX_PROMPT_ABSTRACT_CHARS,
+        ),
+        retry_attempts_per_round=get_config_int(
+            ai_public_config,
+            "retry_attempts_per_round",
+            DEFAULT_RETRY_ATTEMPTS_PER_ROUND,
+        ),
+        retry_rounds=get_config_int(
+            ai_public_config,
+            "retry_rounds",
+            DEFAULT_RETRY_ROUNDS,
+        ),
+        retry_sleep_seconds=get_config_int(
+            ai_public_config,
+            "retry_sleep_seconds",
+            DEFAULT_RETRY_SLEEP_SECONDS,
+        ),
     )
 
 
@@ -322,11 +421,36 @@ def parse_paper_insights(value):
     return insights
 
 
-def paper_for_prompt(entry, index):
+class RequestRateLimiter:
+    def __init__(self, requests_per_minute, time_fn=time.monotonic, sleep_fn=time.sleep):
+        self.min_interval_seconds = 60 / max(1, requests_per_minute)
+        self.time_fn = time_fn
+        self.sleep_fn = sleep_fn
+        self.last_request_at = None
+
+    def wait(self):
+        now = self.time_fn()
+        if self.last_request_at is not None:
+            elapsed = now - self.last_request_at
+            remaining = self.min_interval_seconds - elapsed
+            if remaining > 0:
+                self.sleep_fn(remaining)
+                now = self.time_fn()
+        self.last_request_at = now
+
+
+def limit_prompt_text(value, max_chars):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def paper_for_prompt(entry, index, config):
     return {
         "id": index + 1,
-        "title": entry["title"],
-        "abstract": entry["abstract"],
+        "title": limit_prompt_text(entry["title"], config.max_prompt_title_chars),
+        "abstract": limit_prompt_text(entry["abstract"], config.max_prompt_abstract_chars),
         "journal": entry["journal"],
         "url": entry["url"],
         "pubDate": entry["pubDate"],
@@ -335,7 +459,8 @@ def paper_for_prompt(entry, index):
 
 def create_batch_prompt(config, papers, offset):
     prompt_papers = [
-        paper_for_prompt(paper, offset + index) for index, paper in enumerate(papers)
+        paper_for_prompt(paper, offset + index, config)
+        for index, paper in enumerate(papers)
     ]
     return "\n".join(
         [
@@ -358,7 +483,8 @@ def create_batch_prompt(config, papers, offset):
 
 def create_final_html_prompt(config, papers, insights, generated_at):
     paper_map = {
-        index + 1: paper_for_prompt(paper, index) for index, paper in enumerate(papers)
+        index + 1: paper_for_prompt(paper, index, config)
+        for index, paper in enumerate(papers)
     }
     selected = []
     for insight in insights:
@@ -437,16 +563,49 @@ def wrap_ai_html(ai_html, generated_at, total_count, matched_count):
     )
 
 
-def generate_ai_summary_report(config, papers, client, now):
+def complete_with_retries(client, messages, label, config, rate_limiter, sleep_fn=time.sleep):
+    last_error = None
+    total_attempts = config.retry_attempts_per_round * config.retry_rounds
+
+    for round_index in range(config.retry_rounds):
+        for attempt_index in range(config.retry_attempts_per_round):
+            attempt_number = round_index * config.retry_attempts_per_round + attempt_index + 1
+            try:
+                rate_limiter.wait()
+                return client.complete(messages)
+            except Exception as error:
+                last_error = error
+                print(f"AI {label} attempt {attempt_number}/{total_attempts} failed: {error}")
+
+        if round_index < config.retry_rounds - 1:
+            print(
+                f"AI {label} failed after {config.retry_attempts_per_round} attempts; "
+                f"sleeping {config.retry_sleep_seconds} seconds before the next retry round."
+            )
+            sleep_fn(config.retry_sleep_seconds)
+
+    raise RuntimeError(f"AI {label} failed after {total_attempts} attempts: {last_error}")
+
+
+def generate_ai_summary_report(config, papers, client, now, sleep_fn=time.sleep):
     generated_at = now.isoformat().replace("+00:00", "Z")
     all_insights = []
+    rate_limiter = RequestRateLimiter(
+        config.requests_per_minute,
+        sleep_fn=sleep_fn,
+    )
 
-    for offset, batch in chunked(papers, SCREENING_BATCH_SIZE):
-        result = client.complete(
+    for offset, batch in chunked(papers, config.screening_batch_size):
+        result = complete_with_retries(
+            client,
             [
                 {"role": "system", "content": BATCH_INSIGHT_SYSTEM_PROMPT},
                 {"role": "user", "content": create_batch_prompt(config, batch, offset)},
-            ]
+            ],
+            f"batch {offset // config.screening_batch_size + 1}",
+            config,
+            rate_limiter,
+            sleep_fn,
         )
         all_insights.extend(parse_paper_insights(result))
 
@@ -461,7 +620,8 @@ def generate_ai_summary_report(config, papers, client, now):
             break
 
     if insights:
-        final_html = client.complete(
+        final_html = complete_with_retries(
+            client,
             [
                 {"role": "system", "content": FINAL_HTML_SYSTEM_PROMPT},
                 {
@@ -473,7 +633,11 @@ def generate_ai_summary_report(config, papers, client, now):
                         generated_at,
                     ),
                 },
-            ]
+            ],
+            "final HTML",
+            config,
+            rate_limiter,
+            sleep_fn,
         )
         report_html = wrap_ai_html(final_html, generated_at, len(papers), len(insights))
     else:
@@ -571,29 +735,6 @@ def to_rfc822(value):
     return date.astimezone(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
-def generate_report_with_retries(config, candidates, client, now, sleep_fn=time.sleep):
-    last_error = None
-    total_attempts = RETRY_ATTEMPTS_PER_ROUND * RETRY_ROUNDS
-
-    for round_index in range(RETRY_ROUNDS):
-        for attempt_index in range(RETRY_ATTEMPTS_PER_ROUND):
-            attempt_number = round_index * RETRY_ATTEMPTS_PER_ROUND + attempt_index + 1
-            try:
-                return generate_ai_summary_report(config, candidates, client, now)
-            except Exception as error:
-                last_error = error
-                print(f"AI summary attempt {attempt_number}/{total_attempts} failed: {error}")
-
-        if round_index < RETRY_ROUNDS - 1:
-            print(
-                f"AI summary failed after {RETRY_ATTEMPTS_PER_ROUND} attempts; "
-                f"sleeping {RETRY_SLEEP_SECONDS} seconds before the next retry round."
-            )
-            sleep_fn(RETRY_SLEEP_SECONDS)
-
-    raise RuntimeError(f"AI summary failed after {total_attempts} attempts: {last_error}")
-
-
 def run_ai_summary(config=None, client=None, now=None, sleep_fn=time.sleep):
     config = config or load_ai_config()
     if config is None:
@@ -618,7 +759,7 @@ def run_ai_summary(config=None, client=None, now=None, sleep_fn=time.sleep):
     print(f"Starting AI summary for {len(candidates)} candidate papers...")
     client = client or ChatCompletionClient(config)
     try:
-        report = generate_report_with_retries(config, candidates, client, now, sleep_fn)
+        report = generate_ai_summary_report(config, candidates, client, now, sleep_fn)
         write_ai_html(report)
         write_ai_feed(report)
     except Exception as error:

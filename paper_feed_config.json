@@ -1,0 +1,18 @@
+{
+  "rss": {
+    "fetch_interval_hours": 6
+  },
+  "ai_summary": {
+    "enabled": true,
+    "interval_hours": 24,
+    "max_candidates": 100,
+    "screening_batch_size": 10,
+    "requests_per_minute": 5,
+    "max_output_tokens": 4096,
+    "max_prompt_title_chars": 240,
+    "max_prompt_abstract_chars": 1200,
+    "retry_attempts_per_round": 3,
+    "retry_rounds": 2,
+    "retry_sleep_seconds": 600
+  }
+}

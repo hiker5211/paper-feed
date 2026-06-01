@@ -19,7 +19,6 @@
 *   **数据清洗**：内置 XML 字符清洗程序，自动移除非法字符，确保订阅源的兼容性与稳定性。
 *   **隐私保护**：支持通过 GitHub Secrets 注入配置，隐藏用户的研究领域与关注列表。
 *   **AI 总结（可选）**：支持调用 OpenAI 兼容接口，对新增命中文献生成中文 HTML 总结，并输出独立 RSS。
-*   **通用兼容**：生成的 `filtered_feed.xml` 遵循 RSS 2.0 标准，适配所有主流 RSS 阅读器。
 
 ---
 
@@ -27,9 +26,10 @@
 
 ### 1. 初始化项目
 1.  点击本页面右上角的 **Fork**，将仓库复制到你的账号下。
-2.  在你的仓库中，删除根目录下的 `filtered_feed.xml` 文件（清除示例数据）。
+2.  在你的仓库中，删除根目录下的 `filtered_feed.xml ai_summary_feed.xml ai_summary.html ai_summary_state.json` 文件（清除示例数据，可选）。
 
 ### 2. 配置参数
+
 提供两种配置方式，**涉及未发表 Idea 或敏感方向建议使用方式 B**。
 
 #### 方式 A：文件配置（公开可见）
@@ -58,11 +58,38 @@ AI 总结默认不强制启用。只有当以下必需 Secrets 都存在时，`a
 
 *   **Name**: `AI_SUMMARY_PROMPT` | **Secret**: 你的研究方向，建议按重要性排序分行填写，可以是关键词、短句或者一句话。
 
-可选 Secrets：
+非敏感参数在 `paper_feed_config.json` 中修改，无需删除或新增 GitHub Actions 变量：
 
-*   `AI_SUMMARY_ENABLED`：设为 `false`、`0`、`no` 或 `off` 时强制关闭 AI 总结。
-*   `AI_SUMMARY_INTERVAL_HOURS`：AI 总结间隔，默认 `24` 小时。
-*   `AI_SUMMARY_MAX_CANDIDATES`：每次最多提交给 AI 的新增候选文献数，默认 `100`。
+```json
+{
+  "rss": {
+    "fetch_interval_hours": 8
+  },
+  "ai_summary": {
+    "enabled": true,
+    "interval_hours": 24,
+    "max_candidates": 100,
+    "screening_batch_size": 10,
+    "requests_per_minute": 5,
+    "max_output_tokens": 8192,
+    "max_prompt_title_chars": 512,
+    "max_prompt_abstract_chars": 4096,
+    "retry_attempts_per_round": 3,
+    "retry_rounds": 2,
+    "retry_sleep_seconds": 600
+  }
+}
+```
+
+其中：
+
+`max_candidates` 每次生成html文件使用多少篇未使用的文献，没有总结过的会留到下次；
+
+`screening_batch_size` 单次发送多少篇文献给AI总结，太多了考验AI上下文，可能会丢文献，太少了请求次数过多；
+
+`requests_per_minute` 是 AI API 请求速率限制，默认 `5`，即相邻两次请求至少间隔约 12 秒；
+
+`max_output_tokens` 用于避免模型输出过长、生成时间过久导致网关超时，太多内容被截断可以尝试调大。
 
 AI 总结会生成：
 
@@ -89,11 +116,13 @@ AI 总结会生成：
     `https://{你的GitHub用户名}.github.io/{仓库名}/filtered_feed.xml`
     若启用了 AI 总结，AI 订阅链接为：
     `https://{你的GitHub用户名}.github.io/{仓库名}/ai_summary_feed.xml`
+    当然你也可以直接在浏览器访问：
+    `https://{你的GitHub用户名}.github.io/{仓库名}/ai_summary.html`
 2.  **添加订阅**：
     *   Zotero 菜单栏：`文件` -> `新建文献库` -> `新建订阅` -> `从网址`。
     *   粘贴上述链接。
 3.  **设置同步频率**：
-    *   建议在 Zotero 订阅设置中将更新时间设为 **8小时** 或更短，以匹配后端的更新频率。
+    *   建议在 Zotero 订阅设置中将更新时间设为与 `fetch_interval_hours` 相同或更短，以匹配后端的更新频率。
 
 ---
 
